@@ -1,0 +1,194 @@
+---
+title: "Beer Reviews"
+author: "Kaylin Pavlik"
+date: "1/19/18"
+output: html_document
+---
+
+```{r setup, warning=F, error=F, message=F}
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(magrittr)
+library(tidytext)
+library(tidyr)
+library(corrplot)
+library(class)
+library(caret)
+
+knitr::opts_chunk$set(echo = TRUE, warning=F, error=F, message=F)
+beer <- read.csv("data/brewery_beers.csv", stringsAsFactors=F)
+beer_reviews <- read.csv("data/brewery_beers_reviews.csv", stringsAsFactors=F)
+beer_reviews <- merge(beer, beer_reviews, by="Beer_URL", all.x=T)
+beer_reviews <- beer_reviews[!duplicated(beer_reviews[,c(1:9)]),]
+```
+
+```{r tidy}
+# keep just the top 51 beer styles
+styles50 <- data.frame(table(beer$Style)) %>% 
+  set_colnames(c("Style", "Num")) %>% 
+  top_n(50, Num)
+beer_reviews <- subset(beer_reviews, Style %in% styles50$Style)
+
+# tidy up the text
+beer_tidy <- beer_reviews %>%
+  unnest_tokens(word, Review_Text) %>%
+  anti_join(stop_words) %>%
+  count(word, Style)
+
+head(beer_tidy)
+```
+
+
+# TF-IDF  
+
+```{r tfidf, fig.height=12, fig.width=12}
+# take out beer names
+exceptions <- c("extra", "strong", "bitter", "oatmeal", "brown", "heavy", 
+                "dry", "black", "amber", "red", "milk",
+                "fruit", "dark", "sweet", "alcohol", "cream", "light")
+
+beer_names <- paste(gsub("[[:punct:]]", "", styles50$Style), collapse=" ") %>%
+  tolower() %>%
+  strsplit(" | \ ") %>%
+  unlist() %>%
+  unique() %>%
+  c("marzen", "kolsch", "hefe", "triple", "dopplebock") %>%
+  subset(!. %in% exceptions)
+  
+# remove beer names, calculate word total and tf-idf
+beer_tidy_tfidf <- beer_tidy %>%
+  filter(!word %in% beer_names) %>%
+  group_by(word) %>%
+  mutate(word_total = sum(n)) %>%
+  bind_tf_idf(word, Style, n)  %>%
+  subset(tf_idf > 0) %>%
+  arrange(desc(tf_idf)) 
+
+# create a df for plotting of the top 16 beers by # reviews
+top_beers <- aggregate(Reviews ~ Style, beer_reviews, sum) %>% top_n(16, Reviews)
+beer_tidy_tfidf_10 <- beer_tidy_tfidf %>%
+  subset(Style %in% top_beers$Style & word_total >= 10) %>%
+  group_by(Style) %>%
+  top_n(10, tf_idf) %>%
+  arrange(Style, desc(tf_idf)) %>%
+  ungroup() %>%
+  mutate(Rank = rep(10:1, 16))
+
+ggplot(beer_tidy_tfidf_10, aes(x=as.factor(Rank), y=tf_idf)) + 
+  geom_bar(stat="identity", fill="cadetblue", alpha=0.5) + 
+  coord_flip() + facet_wrap(~ Style,ncol=4) + 
+  geom_text(aes(label=word, x=Rank), y=0,hjust=0) +
+  labs(title="Top TF-IDF Terms for Selected Beer Styles\n", x="", y="tf-idf") + 
+  theme_classic(base_size=10, base_family="Avenir") +
+  theme(axis.text.y=element_blank(), 
+                     axis.ticks.y=element_blank(),
+                     plot.title=element_text(size=18, face="bold", family="Avenir"),
+                     panel.background  = element_blank(),
+                     legend.background = element_rect(fill="transparent", colour=NA),
+                     legend.key = element_rect(fill="transparent", colour=NA)) 
+
+```
+# Correlation  
+
+```{r textCorr}
+# get the proportion of words in each style and create a matrix 
+# with styles as columns and words as rows
+beer_corr <- beer_tidy %>%
+  subset(!is.na(Style)) %>%
+  group_by(Style) %>%
+  mutate(Prop = n / sum(n))  %>%
+  subset(n >= 5) %>%
+  select(-n) %>%
+  spread(Style, Prop) 
+beer_corr[is.na(beer_corr)] <- 0 # replace NAs with 0 because an NA is an observation of 0 words
+
+mycol <- colorRampPalette(c("darkgrey", "grey", "white", "cadetblue1", "cadetblue"))
+corr <- cor(beer_corr[,-1], use = "pairwise.complete.obs") %>% 
+  corrplot(method="color", order="hclust", diag=FALSE, 
+           tl.col = "black", tl.srt = 45, tl.cex=0.6,
+           col=mycol(100), 
+           type="lower",title="Correlation Between Beer Styles", family="Avenir",
+           mar=c(0,0,1,0))
+
+```
+# Cluster  
+
+```{r textCluster, fig.height=6, fig.width=12}
+# transpose the matrix to have styles as rows 
+# and words as columns
+beer_corr_t <- t(beer_corr[,-1])
+
+wss <- 0
+for(g in 1:15){
+  fit <- kmeans(beer_corr_t, centers=g, nstart=10)
+  wss[g] <- fit$tot.withinss
+}
+plot(wss)
+fit_k <- kmeans(beer_corr_t, centers=8, nstart=10)
+kclusters <- data.frame(num=fit_k$cluster, name=names(fit_k$cluster), row.names=NULL) %>% arrange(num)
+print(kclusters)
+
+beer_dist <- dist(beer_corr_t, method="euclidean")
+fit <- hclust(beer_dist, method="ward.D")
+plot(fit,main="Cluster Dendrogram of Beer Styles", family="Avenir")
+rect.hclust(fit, k=8, border="cadetblue")
+```
+
+# Classify  
+
+```{r classify}
+# add groups to the dataset
+groupnames <- data.frame(
+  Name=c("Red Ale", "Brown and Scottish Ale","Stout and Porter", "Pilsener and Lager","IPA", "Belgian", "Gose", "Pumpkin"), 
+  Group=c(1:8))
+groups <- data.frame(cutree(fit, k=8)) %>%
+  set_colnames("Group") %>%
+  mutate(Style = row.names(.)) %>%
+  left_join(groupnames, "Group")
+beer_kgroup <- merge(beer_reviews[beer_reviews$Style %in% groups$Style & !is.na(beer_reviews$Review_Text),], 
+                     groups[,2:3], by="Style", all=T)
+
+# tidy the text by individual beer review, keeping words
+# that account for at least 0.05% of a review
+beer_corr_knn <- beer_kgroup %>%
+  unnest_tokens(word, Review_Text) %>%
+  anti_join(stop_words) %>%
+  count(word, Beer_URL) %>%
+  group_by(Beer_URL) %>%
+  mutate(Prop = n / sum(n))  %>%
+  subset(Prop >= .005) %>%
+  select(-n) %>%
+  spread(word, Prop) %>%
+  left_join(beer_kgroup[,c(2,13)], by = "Beer_URL")
+beer_corr_knn[is.na(beer_corr_knn)] <- 0
+
+# randomly take 20% of the dataset
+set.seed(1234)
+subset_ids <- sample(1:length(beer_corr_knn$Beer_URL), length(beer_corr_knn$Beer_URL)*.20, replace=F)
+beer_corr_subset <- beer_corr_knn[subset_ids, ]
+
+# split that into 80% training and 20% test
+train_ids <- sample(length(beer_corr_subset$Beer_URL), length(beer_corr_subset$Beer_URL)*.80, replace=F)
+last <- length(beer_corr_subset)
+train_bk <- beer_corr_subset[train_ids, -c(1,last)] # training
+test_bk <- beer_corr_subset[-train_ids, -c(1,last)] # testing
+train_resp <- beer_corr_subset[train_ids, c(1,last)] # groups for training
+test_resp <- beer_corr_subset[-train_ids, c(1,last)] # groups for testing
+
+# run kNN
+system.time(kresult <- knn(train = train_bk, test = test_bk, cl = train_resp$Name.y, k = 1))
+# took: about 10 minutes
+
+# check results
+knn_results <- data.frame(round(prop.table(table(kresult, test_resp$Name.y),2),2)) %>%
+  set_colnames(c("Classification", "Actual", "Pct")) %>%
+  mutate(Classfication = factor(Classification, labels=groupnames$Name),
+         Actual = factor(Actual, labels=groupnames$Name))
+
+ggplot(knn_results, aes(Actual, Pct, fill=Classification)) + 
+  geom_bar(stat="identity", position="dodge", alpha=0.75) +
+  labs(title="Accuracy of KNN Classification into HClusters\n", y = "Percent") + 
+  theme_classic(base_size=10, base_family="Avenir") + 
+  theme(axis.text.x=element_text(angle=30, hjust=1)) + ylim(c(0,1))
+```
